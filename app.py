@@ -10,8 +10,18 @@ import base64
 import wave
 import struct
 import json
+import tempfile
+import os
 from scipy import stats as scipy_stats
 from fpdf import FPDF
+
+# Librosa for universal audio format support (WAV, MP3, FLAC, OGG, M4A, MPEG, etc.)
+try:
+    import librosa
+    import soundfile as sf
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIGURATION
@@ -305,61 +315,103 @@ if 'current_audio' not in st.session_state:
 # CORE AUDIO PROCESSING FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _detect_audio_format(data_bytes):
+    """Infer audio format from magic bytes"""
+    if len(data_bytes) < 4:
+        return "unknown"
+    if data_bytes[:4] == b'RIFF':
+        return "wav"
+    if data_bytes[:4] == b'fLaC':
+        return "flac"
+    if data_bytes[:4] == b'OggS':
+        return "ogg"
+    if data_bytes[:3] == b'ID3':
+        return "mp3"
+    # MP3 frame sync
+    if len(data_bytes) > 1 and data_bytes[0] == 0xFF and (data_bytes[1] & 0xE0) == 0xE0:
+        return "mp3"
+    if data_bytes[4:8] == b'ftyp':
+        return "m4a"
+    return "unknown"
+
+
 def load_real_audio(uploaded_file):
-    """Load actual audio file - supports WAV format only"""
-    try:
-        wav_bytes = uploaded_file.read()
-        wav_io = io.BytesIO(wav_bytes)
+    """Load audio file - supports WAV, MP3, FLAC, OGG, M4A, MPEG via librosa.
 
-        # Check if this is actually a WAV file by inspecting the header
-        header = wav_bytes[:4]
-        if header != b'RIFF':
-            # Detect common non-WAV audio formats
-            if wav_bytes[:3] == b'ID3' or (len(wav_bytes) > 1 and wav_bytes[0] == 0xFF and (wav_bytes[1] & 0xE0) == 0xE0):
-                fmt = "MP3"
-            elif wav_bytes[:4] == b'OggS':
-                fmt = "OGG"
-            elif wav_bytes[:4] == b'fLaC':
-                fmt = "FLAC"
-            else:
-                fmt = "Unknown/Compressed"
+    Returns:
+        (audio_data as float32 mono np.ndarray, sample_rate, playback_bytes)
+    """
+    raw_bytes = uploaded_file.read()
+    fmt = _detect_audio_format(raw_bytes)
+    filename = getattr(uploaded_file, 'name', 'audio.wav')
+    ext = filename.split('.')[-1].lower() if '.' in filename else fmt
 
-            st.error(
-                f"❌ **Unsupported format ({fmt})**. This platform requires **uncompressed WAV files**. "
-                f"Please convert your file to WAV at "
-                f"[CloudConvert](https://cloudconvert.com/mp3-to-wav) or similar tool, then re-upload. "
-                f"Using synthetic audio for demo purposes so you can explore the interface."
-            )
-            sr = 22050
-            duration = 5
-            audio_data = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, duration * sr)) * 0.3 +
-                          np.random.randn(duration * sr) * 0.1).astype(np.float32)
-            return audio_data, sr, None
+    # Fast path: native WAV parsing (no librosa needed)
+    if fmt == "wav":
+        try:
+            with wave.open(io.BytesIO(raw_bytes), 'rb') as wav_file:
+                sr = wav_file.getframerate()
+                n_channels = wav_file.getnchannels()
+                n_frames = wav_file.getnframes()
+                audio_bytes = wav_file.readframes(n_frames)
 
-        with wave.open(wav_io, 'rb') as wav_file:
-            sr = wav_file.getframerate()
-            n_channels = wav_file.getnchannels()
-            n_frames = wav_file.getnframes()
-            audio_bytes = wav_file.readframes(n_frames)
+                sampwidth = wav_file.getsampwidth()
+                if sampwidth == 2:
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                elif sampwidth == 4:
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
+                elif sampwidth == 1:
+                    audio_data = (np.frombuffer(audio_bytes, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+                else:
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-            if wav_file.getsampwidth() == 2:
-                audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
-            else:
-                audio_data = np.frombuffer(audio_bytes, dtype=np.uint8)
+                if n_channels == 2:
+                    audio_data = audio_data.reshape(-1, 2).mean(axis=1)
 
-            audio_data = audio_data.astype(np.float32) / 32768.0
+                return audio_data, sr, raw_bytes
+        except Exception:
+            pass  # Fall through to librosa
 
-            if n_channels == 2:
-                audio_data = audio_data.reshape(-1, 2).mean(axis=1)
+    # Librosa path for MP3, FLAC, OGG, M4A, MPEG, and fallback for tricky WAVs
+    if LIBROSA_AVAILABLE:
+        try:
+            # Write to temp file so librosa/audioread can probe the format
+            suffix = f".{ext}" if ext in ('wav', 'mp3', 'flac', 'ogg', 'm4a', 'mpeg', 'aac') else '.wav'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
 
-            return audio_data, sr, wav_bytes
-    except Exception as e:
-        st.warning(f"Could not decode audio file: {e}. Using synthetic audio for demo.")
-        sr = 22050
-        duration = 5
-        audio_data = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, duration * sr)) * 0.3 +
-                      np.random.randn(duration * sr) * 0.1).astype(np.float32)
-        return audio_data, sr, None
+            try:
+                # librosa.load handles all formats via soundfile/audioread; returns mono float32
+                audio_data, sr = librosa.load(tmp_path, sr=None, mono=True)
+                audio_data = audio_data.astype(np.float32)
+
+                # Generate WAV bytes for st.audio playback (works in all browsers)
+                wav_buffer = io.BytesIO()
+                sf.write(wav_buffer, audio_data, sr, format='WAV', subtype='PCM_16')
+                wav_buffer.seek(0)
+                playback_bytes = wav_buffer.read()
+
+                return audio_data, sr, playback_bytes
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            st.warning(f"Could not decode {fmt.upper()} file: {e}. Using synthetic audio for demo.")
+    else:
+        st.error(
+            "Audio decoder (librosa) not installed. Run `pip install librosa soundfile` "
+            "or wait for Streamlit Cloud to finish installing requirements."
+        )
+
+    # Fallback: synthetic demo audio
+    sr = 22050
+    duration = 5
+    audio_data = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, duration * sr)) * 0.3 +
+                  np.random.randn(duration * sr) * 0.1).astype(np.float32)
+    return audio_data, sr, None
 
 
 def calculate_acoustic_indices(audio_data, sr=22050):
@@ -1199,15 +1251,14 @@ if processing_mode == "Single File Analysis":
         <div style="border: 2px dashed #3b82f6; border-radius: 12px; padding: 30px; text-align: center;
                     background: white; margin: 10px 0;">
             <h3 style="color: #1e293b; margin: 0;">Upload Audio File</h3>
-            <p style="color: #64748b;">Supported format: <strong>WAV (uncompressed)</strong></p>
-            <p style="color: #94a3b8; font-size: 12px;">Tip: Convert MP3/MPEG to WAV online at <a href="https://cloudconvert.com/mp3-to-wav" target="_blank">CloudConvert</a> before uploading.</p>
+            <p style="color: #64748b;">Supported formats: <strong>WAV &bull; MP3 &bull; FLAC &bull; OGG &bull; M4A &bull; MPEG &bull; AAC</strong></p>
         </div>
         """, unsafe_allow_html=True)
 
         uploaded_file = st.file_uploader(
-            "Choose a WAV audio file",
-            type=['wav'],
-            help="Upload an uncompressed WAV recording. MP3/MPEG files must be converted to WAV first."
+            "Choose an audio file",
+            type=['wav', 'mp3', 'flac', 'ogg', 'm4a', 'mpeg', 'aac', 'mp4'],
+            help="Upload a bioacoustic recording. All major audio formats are supported."
         )
 
     with col2:
@@ -1993,11 +2044,15 @@ elif processing_mode == "Compare Recordings":
 
     with c1:
         st.markdown("### Recording A")
-        file_a = st.file_uploader("Upload Recording A", type=['wav'], key='file_a')
+        file_a = st.file_uploader("Upload Recording A",
+                                  type=['wav', 'mp3', 'flac', 'ogg', 'm4a', 'mpeg', 'aac', 'mp4'],
+                                  key='file_a')
 
     with c2:
         st.markdown("### Recording B")
-        file_b = st.file_uploader("Upload Recording B", type=['wav'], key='file_b')
+        file_b = st.file_uploader("Upload Recording B",
+                                  type=['wav', 'mp3', 'flac', 'ogg', 'm4a', 'mpeg', 'aac', 'mp4'],
+                                  key='file_b')
 
     if file_a and file_b:
         with st.spinner("Analyzing both recordings..."):
@@ -2109,9 +2164,10 @@ elif processing_mode == "Batch Processing":
         """, unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "Choose WAV audio files", type=['wav'],
+        "Choose audio files",
+        type=['wav', 'mp3', 'flac', 'ogg', 'm4a', 'mpeg', 'aac', 'mp4'],
         accept_multiple_files=True,
-        help="Upload uncompressed WAV files only. Convert MP3s to WAV before uploading."
+        help="Upload multiple audio files in any supported format."
     )
 
     if uploaded_files:
