@@ -306,10 +306,35 @@ if 'current_audio' not in st.session_state:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_real_audio(uploaded_file):
-    """Load actual audio file - supports WAV format"""
+    """Load actual audio file - supports WAV format only"""
     try:
         wav_bytes = uploaded_file.read()
         wav_io = io.BytesIO(wav_bytes)
+
+        # Check if this is actually a WAV file by inspecting the header
+        header = wav_bytes[:4]
+        if header != b'RIFF':
+            # Detect common non-WAV audio formats
+            if wav_bytes[:3] == b'ID3' or (len(wav_bytes) > 1 and wav_bytes[0] == 0xFF and (wav_bytes[1] & 0xE0) == 0xE0):
+                fmt = "MP3"
+            elif wav_bytes[:4] == b'OggS':
+                fmt = "OGG"
+            elif wav_bytes[:4] == b'fLaC':
+                fmt = "FLAC"
+            else:
+                fmt = "Unknown/Compressed"
+
+            st.error(
+                f"❌ **Unsupported format ({fmt})**. This platform requires **uncompressed WAV files**. "
+                f"Please convert your file to WAV at "
+                f"[CloudConvert](https://cloudconvert.com/mp3-to-wav) or similar tool, then re-upload. "
+                f"Using synthetic audio for demo purposes so you can explore the interface."
+            )
+            sr = 22050
+            duration = 5
+            audio_data = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, duration * sr)) * 0.3 +
+                          np.random.randn(duration * sr) * 0.1).astype(np.float32)
+            return audio_data, sr, None
 
         with wave.open(wav_io, 'rb') as wav_file:
             sr = wav_file.getframerate()
@@ -329,10 +354,11 @@ def load_real_audio(uploaded_file):
 
             return audio_data, sr, wav_bytes
     except Exception as e:
-        st.error(f"Error loading audio: {e}")
+        st.warning(f"Could not decode audio file: {e}. Using synthetic audio for demo.")
         sr = 22050
         duration = 5
-        audio_data = np.random.randn(duration * sr).astype(np.float32) * 0.3
+        audio_data = (np.sin(2 * np.pi * 440 * np.linspace(0, duration, duration * sr)) * 0.3 +
+                      np.random.randn(duration * sr) * 0.1).astype(np.float32)
         return audio_data, sr, None
 
 
@@ -1173,14 +1199,15 @@ if processing_mode == "Single File Analysis":
         <div style="border: 2px dashed #3b82f6; border-radius: 12px; padding: 30px; text-align: center;
                     background: white; margin: 10px 0;">
             <h3 style="color: #1e293b; margin: 0;">Upload Audio File</h3>
-            <p style="color: #64748b;">Supported formats: WAV &bull; MP3 &bull; FLAC &bull; OGG</p>
+            <p style="color: #64748b;">Supported format: <strong>WAV (uncompressed)</strong></p>
+            <p style="color: #94a3b8; font-size: 12px;">Tip: Convert MP3/MPEG to WAV online at <a href="https://cloudconvert.com/mp3-to-wav" target="_blank">CloudConvert</a> before uploading.</p>
         </div>
         """, unsafe_allow_html=True)
 
         uploaded_file = st.file_uploader(
-            "Choose an audio file",
-            type=['wav', 'mp3', 'flac', 'ogg'],
-            help="Upload a bioacoustic recording for comprehensive analysis"
+            "Choose a WAV audio file",
+            type=['wav'],
+            help="Upload an uncompressed WAV recording. MP3/MPEG files must be converted to WAV first."
         )
 
     with col2:
@@ -2082,8 +2109,9 @@ elif processing_mode == "Batch Processing":
         """, unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "Choose audio files", type=['wav', 'mp3', 'flac', 'ogg'],
-        accept_multiple_files=True
+        "Choose WAV audio files", type=['wav'],
+        accept_multiple_files=True,
+        help="Upload uncompressed WAV files only. Convert MP3s to WAV before uploading."
     )
 
     if uploaded_files:
@@ -2390,8 +2418,23 @@ else:
             st.markdown("### Species Count vs Health Score")
             fig_svh = px.scatter(df, x='species_count', y='health_score',
                                 color='location' if 'location' in df.columns else None,
-                                trendline='ols', title='Biodiversity-Health Relationship',
+                                title='Biodiversity-Health Relationship',
                                 labels={'species_count': 'Species Count', 'health_score': 'Health Score'})
+
+            # Manual trendline using numpy polyfit (avoids statsmodels dependency)
+            x_vals = df['species_count'].values
+            y_vals_tr = df['health_score'].values
+            if len(x_vals) > 1:
+                z_tr = np.polyfit(x_vals, y_vals_tr, 1)
+                p_tr = np.poly1d(z_tr)
+                x_range = np.linspace(x_vals.min(), x_vals.max(), 100)
+                corr_coef = np.corrcoef(x_vals, y_vals_tr)[0, 1]
+                fig_svh.add_trace(go.Scatter(
+                    x=x_range, y=p_tr(x_range),
+                    mode='lines', name=f'Trend (r={corr_coef:.2f})',
+                    line=dict(color='#1e293b', width=3, dash='dash')
+                ))
+
             fig_svh.update_layout(height=450, template='plotly_white')
             st.plotly_chart(fig_svh, use_container_width=True)
 
